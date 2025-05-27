@@ -4,115 +4,129 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import jakarta.persistence.Query;
 import org.hibernate.engine.spi.SessionFactoryImplementor;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Repository;
 
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.sql.*;
 import java.util.*;
 import org.hibernate.engine.jdbc.connections.spi.ConnectionProvider;
 import org.hibernate.engine.spi.SessionFactoryImplementor;
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
+import java.util.stream.Collectors;
+
 
 @Repository
 public class DynamicQueryRepositoryImpl implements DynamicQueryRepository {
 
     @PersistenceContext
     private EntityManager entityManager;
-//
-//    @Override
-//    public List<Map<String, Object>> executeDynamicSql(String sql) {
-//        List<Map<String, Object>> resultList = new ArrayList<>();
-//
-//        try {
-//            Query nativeQuery = entityManager.createNativeQuery(sql);
-//            List<?> results = nativeQuery.getResultList();
-//
-//            // Use Hibernate unwrap to get JDBC metadata
-//            if (results.isEmpty()) return resultList;
-//
-//            List<String> columnNames = new ArrayList<>();
-//            if (results.get(0) instanceof Object[]) {
-//                int columnCount = ((Object[]) results.get(0)).length;
-//                for (int i = 0; i < columnCount; i++) {
-//                    columnNames.add("col" + (i + 1)); // Generic fallback names
-//                }
-//            } else {
-//                columnNames.add("col1");
-//            }
-//
-//            for (Object row : results) {
-//                Map<String, Object> map = new LinkedHashMap<>();
-//
-//                if (row instanceof Object[]) {
-//                    Object[] rowArray = (Object[]) row;
-//                    for (int i = 0; i < rowArray.length; i++) {
-//                        map.put(columnNames.get(i), rowArray[i]);
-//                    }
-//                } else {
-//                    map.put(columnNames.get(0), row); // Single column result
-//                }
-//
-//                resultList.add(map);
-//            }
-//
-//        } catch (Exception e) {
-//            Map<String, Object> error = new HashMap<>();
-//            error.put("error", "SQL execution failed: " + e.getMessage());
-//            resultList.add(error);
-//        }
-//
-//        return resultList;
-//    }
-//
-//
-//    // Optionally parse column names from query or use a fallback
-//    private List<String> getColumnNames(String sql) {
-//        // In production, you'd parse the query or use metadata. Here’s a dummy fallback:
-//        return Arrays.asList("col1", "col2", "col3"); // replace with logic if needed
-//    }
-@Override
-public List<Map<String, Object>> executeDynamicSql(String sql) {
-    List<Map<String, Object>> resultList = new ArrayList<>();
 
-    try {
-        SessionFactoryImplementor sessionFactory = entityManager
-                .getEntityManagerFactory()
-                .unwrap(SessionFactoryImplementor.class);
+    @Autowired
+    private FileUploadService fileUploadService;
 
-        Connection connection = sessionFactory
-                .getServiceRegistry()
-                .getService(ConnectionProvider.class)
-                .getConnection();
+    @Override
+    public List<Map<String, Object>> executeDynamicSql(String sql) {
+        List<Map<String, Object>> resultList = new ArrayList<>();
 
-        try (PreparedStatement stmt = connection.prepareStatement(sql);
-             ResultSet rs = stmt.executeQuery()) {
+        try {
+            SessionFactoryImplementor sessionFactory = entityManager
+                    .getEntityManagerFactory()
+                    .unwrap(SessionFactoryImplementor.class);
 
-            ResultSetMetaData metaData = rs.getMetaData();
-            int columnCount = metaData.getColumnCount();
+            Connection connection = sessionFactory
+                    .getServiceRegistry()
+                    .getService(ConnectionProvider.class)
+                    .getConnection();
 
-            while (rs.next()) {
-                Map<String, Object> row = new LinkedHashMap<>();
-                for (int i = 1; i <= columnCount; i++) {
-                    String columnName = metaData.getColumnLabel(i);
-                    row.put(columnName, rs.getObject(i));
+            try (Statement stmt = connection.createStatement()) {
+                String lowerSql = sql.trim().toLowerCase();
+
+                // If it's a SELECT query
+                if (lowerSql.startsWith("select")) {
+                    try (ResultSet rs = stmt.executeQuery(sql)) {
+                        ResultSetMetaData metaData = rs.getMetaData();
+                        int columnCount = metaData.getColumnCount();
+
+                        while (rs.next()) {
+                            Map<String, Object> row = new LinkedHashMap<>();
+                            for (int i = 1; i <= columnCount; i++) {
+                                row.put(metaData.getColumnLabel(i), rs.getObject(i));
+                            }
+                            resultList.add(row);
+                        }
+                    }
+                } else {
+                    // For INSERT, UPDATE, COPY, CREATE, etc.
+                    boolean hasResultSet = stmt.execute(sql);
+
+                    Map<String, Object> map = new HashMap<>();
+                    if (!hasResultSet) {
+                        int updateCount = stmt.getUpdateCount();
+                        map.put("info", "Statement executed. Update count: " + updateCount);
+                    } else {
+                        map.put("info", "Statement executed.");
+                    }
+                    resultList.add(map);
                 }
-                resultList.add(row);
+
+            } finally {
+                connection.close();
             }
 
-        } finally {
-            connection.close(); // always close!
+        } catch (Exception e) {
+            String message = e.getMessage().toLowerCase();
+            Map<String, Object> result = new HashMap<>();
+
+            if (message.contains("already exists")) {
+                result.put("info", "Table already exists. Skipping creation.");
+            } else {
+                result.put("error", "SQL execution failed: " + e.getMessage());
+            }
+
+            resultList.add(result);
         }
 
-    } catch (Exception e) {
-        Map<String, Object> error = new HashMap<>();
-        error.put("error", "SQL execution failed: " + e.getMessage());
-        resultList.add(error);
+        return resultList;
     }
 
-    return resultList;
-}
+    private void handleCopyCommand(String sql, Connection connection) throws Exception {
+        // Extract table name and path
+        Pattern pattern = Pattern.compile("COPY\\s+(\\w+)\\s*\\(([^)]+)\\)\\s*FROM\\s+'([^']+)'", Pattern.CASE_INSENSITIVE);
+        Matcher matcher = pattern.matcher(sql);
 
+        if (!matcher.find()) {
+            throw new IllegalArgumentException("Invalid COPY command format");
+        }
+
+        String table = matcher.group(1);
+        String columns = matcher.group(2);
+        String path = matcher.group(3);
+
+        Path filePath = Paths.get(path);
+        List<Map<String, Object>> rows = fileUploadService.parseCsv(filePath);
+        List<String> columnList = Arrays.stream(columns.split(","))
+                .map(String::trim)
+                .toList();
+
+        try (PreparedStatement ps = connection.prepareStatement(buildInsertSql(table, columnList))) {
+            for (Map<String, Object> row : rows) {
+                for (int i = 0; i < columnList.size(); i++) {
+                    ps.setObject(i + 1, row.get(columnList.get(i)));
+                }
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        }
+    }
+
+    private String buildInsertSql(String table, List<String> columns) {
+        String cols = String.join(", ", columns);
+        String placeholders = columns.stream().map(col -> "?").collect(Collectors.joining(", "));
+        return "INSERT INTO " + table + " (" + cols + ") VALUES (" + placeholders + ")";
+    }
 
 
 }

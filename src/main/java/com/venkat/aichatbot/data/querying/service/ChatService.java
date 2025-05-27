@@ -8,6 +8,10 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.LocalDateTime;
 import java.util.*;
 import org.hibernate.engine.jdbc.connections.spi.ConnectionProvider;
@@ -25,56 +29,67 @@ public class ChatService {
     private final ChatLogRepository chatLogRepository;
     private final SchemaService schemaService;
     private final DynamicQueryRepository dynamicQueryRepository;
-
-   /* public AskResponse processQuestion(String question) {
-        // Fetch real-time schema details
-        String schemaSummary = schemaService.getSchemaDetailsAsString(); // We'll implement this
-
-        // Prompt
-        String systemPrompt = "You are a data assistant. Given the following database schema:\n" +
-                schemaSummary + "\n" +
-                "Answer the user's question and also generate the SQL query inside <sql> </sql> tags.";
-
-        // Append instruction to generate SQL
-        String modifiedQuestion = question + ". Also convert this question into a SQL query using the schema above. Enclose SQL in <sql> </sql>.";
-
-        // Ask GPT
-        String gptResponse = openAIClient.askGPT(systemPrompt, modifiedQuestion);
-
-        String sql = extractSqlFromResponse(gptResponse);
-        String explanation = removeSqlFromResponse(gptResponse);
-
-        ChatLog log = new ChatLog(null, question, sql, explanation, LocalDateTime.now());
-        chatLogRepository.save(log);
-
-        return new AskResponse(explanation.trim(), sql.trim());
-    }*/
-
+    private final FileUploadService fileUploadService;
 
     public AskResponse processQuestion(String question) {
-        // Step 1: Get schema to guide SQL generation
         String schemaSummary = schemaService.getSchemaDetailsAsString();
-        String systemPrompt = "You are a data assistant. Given this database schema:\n" +
-                schemaSummary + "\n" +
-                "Answer the user's question and generate a SQL query wrapped in <sql> </sql>.";
+        String fileMetadata = fileUploadService.describeAvailableFiles();
 
-        // Step 2: Append instruction
+        String systemPrompt = "You are a data assistant. Here is the schema:\n" + schemaSummary +
+                "\nHere is information about uploaded files:\n" + fileMetadata +
+                "\nPlease answer the user's question and generate SQL if applicable.";
+
         String modifiedQuestion = question + ". Also generate the SQL query for this using the schema above. Enclose SQL in <sql> </sql>.";
 
-        // Step 3: Call OpenAI
         String gptResponse = openAIClient.askGPT(systemPrompt, modifiedQuestion);
 
-        // Step 4: Extract and clean
         String sql = extractSqlFromResponse(gptResponse);
         String explanation = removeSqlFromResponse(gptResponse);
 
-        // Step 5: Execute SQL
         List<Map<String, Object>> resultSet = new ArrayList<>();
         if (!sql.isBlank()) {
             resultSet = executeDynamicSql(sql);
-        }
 
-        // Step 6: Log and return
+            // 🔍 Check if it's a SELECT from a table that doesn't exist
+            if (resultSet.size() == 1 && resultSet.get(0).containsKey("error")) {
+                String errorMessage = String.valueOf(resultSet.get(0).get("error"));
+                if (errorMessage.toLowerCase().contains("relation") && errorMessage.toLowerCase().contains("does not exist")) {
+                    String tableName = extractTableNameFromSelect(sql); // ⬅️ see helper below
+
+                    // ✅ If CSV exists, try creating and loading data
+                    if (resultSet.size() == 1 && resultSet.get(0).containsKey("error")) {
+                         errorMessage = String.valueOf(resultSet.get(0).get("error"));
+                        if (errorMessage.toLowerCase().contains("relation") && errorMessage.toLowerCase().contains("does not exist")) {
+                             tableName = extractTableNameFromSelect(sql);
+                            try {
+                                tryLoadFileAndInsert(tableName); // 🔄 Support both CSV/XLSX
+                                resultSet = executeDynamicSql(sql);
+                            } catch (Exception ex) {
+                                Map<String, Object> error = new HashMap<>();
+                                error.put("error", "Auto-recovery failed: " + ex.getMessage());
+                                resultSet.add(error);
+                            }
+                        }
+                    }
+
+                }
+            }
+
+            // ✅ Old logic for CREATE TABLE from LLM
+            if (sql.toLowerCase().contains("create table")) {
+                String createdTable = extractTableNameFromCreateStatement(sql);
+                if (fileUploadService.csvExists(createdTable + ".csv")) {
+                    try {
+                        fileUploadService.insertCsvDataToTable(createdTable + ".csv", createdTable);
+                    } catch (Exception e) {
+                        Map<String, Object> error = new HashMap<>();
+                        error.put("error", "Data insert from CSV failed: " + e.getMessage());
+                        resultSet.add(error);
+                    }
+                }
+            }
+    }
+
         ChatLog log = new ChatLog(null, question, sql, explanation, LocalDateTime.now());
         chatLogRepository.save(log);
 
@@ -85,24 +100,50 @@ public class ChatService {
 
         return response;
     }
+    private String extractTableNameFromSelect(String sql) {
+        String lower = sql.toLowerCase();
+        if (lower.contains("from")) {
+            String[] parts = lower.split("from");
+            if (parts.length > 1) {
+                String[] tokens = parts[1].trim().split("\\s+");
+                return tokens[0].replaceAll("[;]", ""); // remove any trailing semicolon
+            }
+        }
+        return "";
+    }
+
+
     public List<Map<String, Object>> executeDynamicSql(String sql) {
         return dynamicQueryRepository.executeDynamicSql(sql);
     }
 
+    private String extractTableNameFromCreateStatement(String sql) {
+        String lower = sql.toLowerCase();
+        int start = lower.indexOf("create table") + "create table".length();
+        int end = lower.indexOf("(", start);
+        String tablePart = sql.substring(start, end).trim();
+        return tablePart.contains(" ") ? tablePart.split("\\s+")[0] : tablePart;
+    }
 
     private String extractSqlFromResponse(String gptResponse) {
         if (gptResponse.contains("<sql>")) {
             int start = gptResponse.indexOf("<sql>") + 5;
             int end = gptResponse.indexOf("</sql>");
-            if (start < end) return gptResponse.substring(start, end).trim();
-        } else if (gptResponse.contains("```sql")) {
+            if (start < end) {
+                return gptResponse.substring(start, end).replaceAll("(?s)`+", "").trim();
+            }
+        }
+
+        if (gptResponse.contains("```sql")) {
             int start = gptResponse.indexOf("```sql") + 6;
             int end = gptResponse.indexOf("```", start);
-            if (start < end) return gptResponse.substring(start, end).trim();
+            if (start < end) {
+                return gptResponse.substring(start, end).replaceAll("(?s)`+", "").trim();
+            }
         }
-        return "";
-    }
 
+        return gptResponse.replaceAll("(?s)`+", "").trim();
+    }
 
     private String removeSqlFromResponse(String gptResponse) {
         return gptResponse.replaceAll("<sql>.*?</sql>", "").trim();
@@ -126,82 +167,16 @@ public class ChatService {
         }
     }
 
-
-    /*public List<Map<String, Object>> executeDynamicSql(String sql) {
-        List<Map<String, Object>> resultList = new ArrayList<>();
-
-        try {
-            // Get JDBC Connection from Hibernate's EntityManager
-            SessionFactoryImplementor sessionFactory = entityManager
-                    .getEntityManagerFactory()
-                    .unwrap(SessionFactoryImplementor.class);
-
-            Connection connection = sessionFactory
-                    .getServiceRegistry()
-                    .getService(ConnectionProvider.class)
-                    .getConnection();
-
-            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
-                boolean hasResultSet = stmt.execute();
-
-                if (hasResultSet) {
-                    try (ResultSet rs = stmt.getResultSet()) {
-                        ResultSetMetaData metaData = rs.getMetaData();
-                        int columnCount = metaData.getColumnCount();
-
-                        while (rs.next()) {
-                            Map<String, Object> row = new LinkedHashMap<>();
-                            for (int i = 1; i <= columnCount; i++) {
-                                row.put(metaData.getColumnLabel(i), rs.getObject(i));
-                            }
-                            resultList.add(row);
-                        }
-                    }
-                } else {
-                    // For non-SELECT queries, log affected rows or throw if needed
-                    int updateCount = stmt.getUpdateCount();
-                    Map<String, Object> updateResult = new HashMap<>();
-                    updateResult.put("message", "Query executed successfully. Rows affected: " + updateCount);
-                    resultList.add(updateResult);
-                }
-            } finally {
-                connection.close();
-            }
-
-        } catch (Exception e) {
-            Map<String, Object> error = new HashMap<>();
-            error.put("error", "SQL execution failed: " + e.getMessage());
-            resultList.add(error);
+    private void tryLoadFileAndInsert(String tableName) throws Exception {
+        if (fileUploadService.csvExists(tableName + ".csv")) {
+            fileUploadService.createTableFromCsv(tableName + ".csv", tableName);
+            fileUploadService.insertCsvDataToTable(tableName + ".csv", tableName);
+        } else if (fileUploadService.excelExists(tableName + ".xlsx")) {
+            fileUploadService.createTableFromExcel(tableName + ".xlsx", tableName);
+            fileUploadService.insertExcelDataToTable(tableName + ".xlsx", tableName);
         }
-
-        return resultList;
-    }*/
+    }
 
 
-
-
-//    private String normalizePostgreSQL(String sql) {
-//        if (sql == null || sql.isBlank()) return sql;
-//
-//        return sql
-//                // Convert MySQL CURDATE() to PostgreSQL CURRENT_DATE
-//                .replaceAll("(?i)CURDATE\\(\\)", "CURRENT_DATE")
-//                // Convert MySQL-style DATE() function
-//                .replaceAll("(?i)DATE\\(([^)]+)\\)", "$1::date")
-//                // Convert MySQL DATE_SUB to PostgreSQL equivalent
-//                .replaceAll("(?i)DATE_SUB\\(CURRENT_DATE, INTERVAL (\\d+) MONTH\\)", "CURRENT_DATE - INTERVAL '$1 month'")
-//                // Replace backticks with double quotes (PostgreSQL uses double quotes for identifiers)
-//                .replace("`", "\"");
-//    }
-
-
-
-
-    /*private String extractSqlFromResponse(String gptResponse) {
-        int start = gptResponse.indexOf("<sql>") + 5;
-        int end = gptResponse.indexOf("</sql>");
-        if (start == -1 || end == -1 || end <= start) return "";
-        return gptResponse.substring(start, end);
-    }*/
 
 }
