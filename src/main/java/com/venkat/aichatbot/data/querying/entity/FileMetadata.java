@@ -8,26 +8,18 @@ import lombok.NoArgsConstructor;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "chat_logs")
+@Table(name = "file_metadata")
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-public class ChatLog {
+public class FileMetadata {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(length = 10000)
-    private String question;
-
-    @Column(length = 10000)
-    private String generatedSql;
-
-    @Column(length = 10000)
-    private String response;
-
-    private LocalDateTime timestamp;
-
-    @Column(length = 500)
-    private String feedback;
+    private String fileName;      // e.g., sample_sales_data.csv
+    private String tableName;
+    @Column(length = 2000)// e.g., sample_sales_data
+    private String columns;       // Comma-separated headers like "Region,Total,Category"
+    private LocalDateTime uploadedAt;
 }

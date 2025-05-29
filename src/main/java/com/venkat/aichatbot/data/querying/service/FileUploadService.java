@@ -1,5 +1,7 @@
 package com.venkat.aichatbot.data.querying.service;
 
+import com.venkat.aichatbot.data.querying.Repository.FileMetadataRepository;
+import com.venkat.aichatbot.data.querying.entity.FileMetadata;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import org.apache.poi.ss.usermodel.Cell;
@@ -25,6 +27,7 @@ import java.nio.file.StandardCopyOption;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -35,6 +38,9 @@ public class FileUploadService {
 
     @PersistenceContext
     private EntityManager entityManager;
+
+    @Autowired
+    private FileMetadataRepository metadataRepository;
 
     private static final String UPLOAD_DIR = "/Users/venkatkumarvenna/Downloads"; // Or use application.properties
 
@@ -209,7 +215,6 @@ public class FileUploadService {
         Path path = Paths.get(UPLOAD_DIR).resolve(fileName).normalize();
         return Files.exists(path);
     }
-
     public void createTableFromCsv(String fileName, String tableName) throws Exception {
         Path filePath = Paths.get(UPLOAD_DIR).resolve(fileName).normalize();
 
@@ -219,7 +224,7 @@ public class FileUploadService {
 
         try (BufferedReader reader = Files.newBufferedReader(filePath)) {
             String headerLine = reader.readLine();
-            String dataLine = reader.readLine(); // read a sample row
+            String dataLine = reader.readLine(); // read a sample row to infer types
 
             if (headerLine == null || dataLine == null) {
                 throw new RuntimeException("CSV file is empty or missing data");
@@ -228,35 +233,31 @@ public class FileUploadService {
             String[] headers = headerLine.split(",");
             String[] sampleValues = dataLine.split(",");
 
-            // Infer column types based on sample data
-            StringBuilder ddl = new StringBuilder("CREATE TABLE " + tableName + " (\n");
+            StringBuilder ddl = new StringBuilder("CREATE TABLE IF NOT EXISTS " + tableName + " (\n");
             for (int i = 0; i < headers.length; i++) {
-                String column = headers[i].trim();
-                String value = (i < sampleValues.length) ? sampleValues[i].trim() : "";
+                String column = headers[i].trim().replaceAll("[^a-zA-Z0-9_]", "_");
+                String value = i < sampleValues.length ? sampleValues[i].trim() : "";
 
-                String type = "VARCHAR(255)";
-                if (value.matches("^\\d+$")) {
-                    type = "INTEGER";
-                } else if (value.matches("^\\d+\\.\\d+$")) {
-                    type = "NUMERIC";
-                } else if (value.matches("^\\d{4}-\\d{2}-\\d{2}$")) {
-                    type = "DATE";
-                }
+                String type = inferColumnType(value);
 
                 ddl.append("    ").append(column).append(" ").append(type);
-                if (i < headers.length - 1) {
-                    ddl.append(",\n");
-                }
+                if (i < headers.length - 1) ddl.append(",\n");
             }
             ddl.append("\n);");
 
-            // Execute the DDL
-            try (Connection conn = getConnection();
-                 Statement stmt = conn.createStatement()) {
+            try (Connection conn = getConnection(); Statement stmt = conn.createStatement()) {
                 stmt.execute(ddl.toString());
             }
         }
     }
+    private String inferColumnType(String value) {
+        if (value.matches("^\\d{4}-\\d{2}-\\d{2}$")) return "DATE";
+        if (value.matches("^\\d+$")) return "INTEGER";
+        if (value.matches("^\\d+\\.\\d+$")) return "NUMERIC";
+        return "VARCHAR(255)";
+    }
+
+
     private Connection getConnection() throws Exception {
         SessionFactoryImplementor sessionFactory = entityManager
                 .getEntityManagerFactory()
@@ -332,6 +333,20 @@ public class FileUploadService {
         return Files.exists(filePath) && Files.isReadable(filePath);
     }
 
+    public void saveMetadata(String fileName, String tableName, List<String> headers) {
+        FileMetadata meta = new FileMetadata(
+                null,
+                fileName,
+                tableName,
+                String.join(",", headers),
+                LocalDateTime.now()
+        );
+        metadataRepository.save(meta);
+    }
+
+    public List<FileMetadata> getAllMetadata() {
+        return metadataRepository.findAll();
+    }
 
 
 

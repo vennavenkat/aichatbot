@@ -1,12 +1,15 @@
 package com.venkat.aichatbot.data.querying.service;
 
 import com.venkat.aichatbot.data.querying.Repository.ChatLogRepository;
+import com.venkat.aichatbot.data.querying.Repository.FileMetadataRepository;
 import com.venkat.aichatbot.data.querying.client.OpenAIClient;
 import com.venkat.aichatbot.data.querying.dto.AskResponse;
 import com.venkat.aichatbot.data.querying.entity.ChatLog;
+import com.venkat.aichatbot.data.querying.entity.FileMetadata;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.nio.file.Files;
@@ -33,7 +36,15 @@ public class ChatService {
 
     public AskResponse processQuestion(String question) {
         String schemaSummary = schemaService.getSchemaDetailsAsString();
-        String fileMetadata = fileUploadService.describeAvailableFiles();
+        List<FileMetadata> all = fileUploadService.getAllMetadata(); // Create this method in your service
+        StringBuilder schemaPrompt = new StringBuilder("Uploaded files:\n");
+        for (FileMetadata meta : all) {
+            schemaPrompt.append("- Table: ").append(meta.getTableName())
+                    .append(" → Columns: ").append(meta.getColumns())
+                    .append("\n");
+        }
+        String fileMetadata = schemaPrompt.toString();
+
 
         String systemPrompt = "You are a data assistant. Here is the schema:\n" + schemaSummary +
                 "\nHere is information about uploaded files:\n" + fileMetadata +
@@ -90,7 +101,9 @@ public class ChatService {
             }
     }
 
-        ChatLog log = new ChatLog(null, question, sql, explanation, LocalDateTime.now());
+//        ChatLog log = new ChatLog(null, question, sql, explanation, LocalDateTime.now());
+        ChatLog log = new ChatLog(null, question, sql, explanation, LocalDateTime.now(), null);
+
         chatLogRepository.save(log);
 
         AskResponse response = new AskResponse();
@@ -176,6 +189,9 @@ public class ChatService {
             fileUploadService.insertExcelDataToTable(tableName + ".xlsx", tableName);
         }
     }
+
+
+
 
 
 

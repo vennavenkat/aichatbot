@@ -19,10 +19,18 @@ public class Feedback {
     private Long id;
 
     private boolean thumbsUp;
+
+    @Column(length = 1000)
     private String comments;
+
+    @Column(length = 10000)
     private String question;
+
+    @Column(length = 10000)
     private String generatedSql;
+
+    @Column(length = 10000)
     private String responseSummary;
 
-    private LocalDateTime timestamp = LocalDateTime.now();
+    private LocalDateTime timestamp;
 }
